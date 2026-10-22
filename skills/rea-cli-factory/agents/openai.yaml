@@ -1,0 +1,4 @@
+interface:
+  display_name: "REA CLI Factory"
+  short_description: "将应用分析证据转为可验证的 Agent CLI，支持可选 MCP 适配"
+  default_prompt: "使用 $rea-cli-factory，为指定应用的高频任务构建并验证 CLI。"
