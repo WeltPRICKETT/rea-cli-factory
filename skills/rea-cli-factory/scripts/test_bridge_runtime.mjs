@@ -47,6 +47,12 @@ test('generator selects explicitly, emits a usable CLI, refuses overwrite and un
  const original=await fs.readFile(path.join(out,'config.json'),'utf8');await assert.rejects(generate(opts),{code:'EEXIST'});assert.equal(await fs.readFile(path.join(out,'config.json'),'utf8'),original);
  await assert.rejects(generate({...opts,out:path.join(dir,'bad'),selected:['absent']}),{code:'INVALID_SELECTION'});
  await assert.rejects(generate({...opts,out:path.join(dir,'remote'),pageUrl:'https://example.com/'}),{code:'INVALID_PAGE'});
+ const withQuery=config.pageUrl+'?view=fixture&locale=en';
+ await generate({...opts,out:path.join(dir,'query'),pageUrl:withQuery});
+ assert.equal(JSON.parse(await fs.readFile(path.join(dir,'query','config.json'))).pageUrl,withQuery);
+ const querySession={...session,pageUrl:withQuery};
+ assert.equal(selectTarget([{...target,url:withQuery}],querySession).url,withQuery);
+ assert.throws(()=>selectTarget([{...target,url:withQuery.replace('view=fixture','view=other')}],querySession),{code:'WRONG_TARGET'});
  }finally{await fs.rm(dir,{recursive:true,force:true});}
 });
 

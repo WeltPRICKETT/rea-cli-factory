@@ -15,8 +15,8 @@ export async function generate({contractPath,baselinePath,pageUrl,selected,out})
  if(!Array.isArray(selected)||selected.length<1||new Set(selected).size!==selected.length)throw error('INVALID_SELECTION','Select at least one unique method explicitly');
  const methods=selected.map(name=>{const m=contract.candidates.filter(m=>m.apiPath.join('.')===name);if(m.length!==1)throw error('INVALID_SELECTION','Selected method is missing or ambiguous');return validateMethod(m[0]);});
  const page=new URL(pageUrl),root=new URL('file://'+baseline.app_path+'/Contents/Resources/');
- if(page.protocol!=='file:'||page.host||page.search||!page.href.startsWith(root.href))throw error('INVALID_PAGE','Fix one local app resource page URL');
- const config={schema:'rea-cli-factory.generated-bridge.v1',status:'candidate',appPath:baseline.app_path,executable:baseline.identity.CFBundleExecutable,pageUrl:page.href,baselineSha256:sha(raw),evidenceId:contract.evidenceId,source:contract.source,coverage:contract.coverage,methods,limitations:['Generated mapping does not prove safety, argument semantics or runtime availability.','Requires an explicitly owned runtime session and separate business readback.']};
+ if(page.protocol!=='file:'||page.host||!page.href.startsWith(root.href))throw error('INVALID_PAGE','Fix one local app resource page URL');
+ const config={schema:'rea-cli-factory.generated-bridge.v1',status:'candidate',appPath:baseline.app_path,executable:baseline.identity.CFBundleExecutable,pageUrl:page.href,baselineSha256:sha(raw),evidenceId:contract.evidenceId,source:contract.source,...(contract.sources?{sources:contract.sources}:{}),coverage:contract.coverage,methods,limitations:['Generated mapping does not prove safety, argument semantics or runtime availability.','Requires an explicitly owned runtime session and separate business readback.']};
  const destination=path.resolve(out);await fs.mkdir(destination,{mode:0o700});
  try{
   for(const name of ['bridge_runtime.mjs','check_compatibility.py','inventory_app.py'])await fs.copyFile(path.join(ROOT,name),path.join(destination,name),1);

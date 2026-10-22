@@ -20,11 +20,11 @@ node skills/rea-cli-factory/scripts/discover_bridge.mjs \
 
 参考 [盲测与人工介入记录](blind-evaluation.md)，可以先运行 `analyze_electron.mjs`，自动完成有界输入准备、调用指定已安装 REA、对每个选中文件提取并汇总。准备器用 Python 标准库解析 ASAR，无需临时编写提取代码或新增解包依赖。支持唯一声明且未修改的顶层 `const`、`let`、`var` Electron 绑定；仍拒绝重复声明、遮蔽、修改和逃逸。
 
-汇总为 candidate、blocked 或 incomplete，不表示 CLI 已生成。导入包装器、工厂对象等输出具体原因、源码范围和下一步；不会执行源码来尝试求值。既有 REA 结果仍用上面的单文件入口复用，不必重复分析。
+汇总为 candidate、blocked 或 incomplete，不表示 CLI 已生成。流水线会结合单文件提取与 [模块/工厂解析](module-resolution.md)，合并一致的方法，拒绝冲突描述；没有证据支持的导入包装器、工厂对象等仍输出缺口，不执行源码。既有 REA 结果可调用导出的 `discoverCombined(sources, entryName, evidence)` 复用，其中 sources 是精选相对路径到 UTF-8 源码的映射，不必重复分析。
 
 ## 显式选择与生成
 
-先检查任务含义、数据形状与副作用，仅选择必要方法。准备候选安装包清单，最终是否晋升固定已验证基线须由真实结果决定。固定应用主页面 URL：等待应用导航稳定后选择，不能把初始加载 URL 当成最终页面。
+先检查任务含义、数据形状与副作用，仅选择必要方法。准备候选安装包清单，最终是否晋升固定已验证基线须由真实结果决定。固定应用主页面 URL：等待应用导航稳定后选择，不能把初始加载 URL 当成最终页面。允许固定的 query 和 fragment，但会逐字匹配完整 URL；参数改变也必须拒绝调用。
 
 ```sh
 node skills/rea-cli-factory/scripts/generate_bridge_cli.mjs \

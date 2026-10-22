@@ -36,6 +36,8 @@ Electron 候选需验证对应进程/页面、既有 preload/contextBridge 和�
 
 Electron preload 有对应 REA JSON 时，优先按 [静态桥接生成流程](references/bridge-generation.md) 运行 `discover_bridge.mjs`，自动提取可证实的方法/参数，再用 `generate_bridge_cli.mjs` 为显式选中的窄方法生成候选 CLI。仅支持保守的静态子集；unsupported 保留，不猜测复杂逻辑。生成产物仍是私有应用适配器，不能随通用工具公开。
 
+跨文件 CommonJS 包装器和返回对象工厂由流水线内的 `discover_modules.mjs` 补充解析，边界见 [模块与工厂解析](references/module-resolution.md)。保留方法位置、IPC 位置和所有依赖源码摘要；区分工具静态推导的通道与 REA 实际观察，不能把 dynamic 观察写成 REA 已解析。调用原始暴露方法，保留应用返回值处理；未解析的模块、通道或副作用必须停留在错误/unsupported。
+
 运行器调用原桥接方法，绑定本机进程/页面和固定基线；`dispatched`/`returned` 都不是业务 verified。业务参数语义、启动隔离、清理和独立读回仍需验证。分别记录自动恢复的方法数、实际验证数、剩余人工步骤和计时范围，不把再生成速度当作首次交付速度。
 
 ## 制作适配器

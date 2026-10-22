@@ -7,9 +7,24 @@ import {spawn} from 'node:child_process';
 import {performance} from 'node:perf_hooks';
 import {createHash} from 'node:crypto';
 import {discover} from './discover_bridge.mjs';
+import {discoverModules} from './discover_modules.mjs';
 import {readBytes,readJson,error} from './bridge_runtime.mjs';
 const HERE=path.dirname(fileURLToPath(import.meta.url));
 const SHA=b=>createHash('sha256').update(b).digest('hex');
+
+export function discoverCombined(sources,name,evidence){
+ const direct=discover(sources[name],name,evidence),modules=discoverModules(sources,name,evidence);
+ const methods=new Map(),conflicts=new Set();
+ for(const candidate of [...direct.candidates,...modules.candidates]){
+  const key=candidate.apiPath.join('.'),existing=methods.get(key);
+  if(existing&&['params','arity','transport','channel'].some(k=>JSON.stringify(existing[k])!==JSON.stringify(candidate[k])))conflicts.add(key);
+  methods.set(key,candidate);
+ }
+ for(const key of conflicts)methods.delete(key);
+ const names=new Set(methods.keys());
+ const unsupported=[...(modules.candidates.length?modules.unsupported:direct.unsupported),...Array.from(conflicts,name=>({reason:'conflicting-static-descriptors',apiPath:name.split('.')}))].filter(x=>!x.apiPath||!names.has(x.apiPath.join('.')));
+ return {...modules,candidates:[...methods.values()],unsupported,analysis:{...modules.analysis,directCandidates:direct.candidates.length,moduleCandidates:modules.candidates.length,conflicts:conflicts.size}};
+}
 
 // Bounds both output streams and kills the owned process group on timeout/overflow.
 export async function runBounded(command,args,{timeoutMs=180000,maxOutput=64*1024*1024}={}) {
@@ -35,7 +50,7 @@ const ADVICE={
  'no-exposed-api':'No supported static exposure in this selected file; this does not prove absence in the application.'
 };
 export async function analyze({asar,reaCli,out}) {
- const root=path.resolve(out),start=performance.now(),timings={},toolFiles=['analyze_electron.mjs','prepare_electron.py','discover_bridge.mjs'];
+ const root=path.resolve(out),start=performance.now(),timings={},toolFiles=['analyze_electron.mjs','prepare_electron.py','discover_bridge.mjs','discover_modules.mjs'];
  // Caller selects the installed analyzer; never download or execute the app here.
  const reaPath=await fs.realpath(reaCli),reaStat=await fs.stat(reaPath);
  if(!reaStat.isFile()||!['.js','.mjs','.cjs'].includes(path.extname(reaPath)))throw error('INVALID_ANALYZER','Select the installed REA JavaScript CLI file');
@@ -57,13 +72,16 @@ export async function analyze({asar,reaCli,out}) {
   if(r.code!==0)throw error('REA_FAILED','REA did not finish successfully; raw output retained');
   const evidence=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(r.stdout));
   timings.reaMs=Math.round(performance.now()-t);phase='discover';t=performance.now();
-  const records=[];await fs.mkdir(path.join(root,'contracts'),{mode:0o700});
+  const records=[],sources={};await fs.mkdir(path.join(root,'contracts'),{mode:0o700});
+  for(const f of preparation.files.filter(f=>f.path!=='package.json')){
+   const bytes=await readBytes(path.join(root,f.outputPath),2*1024*1024);
+   if(SHA(bytes)!==f.sha256)throw error('PREPARED_SOURCE_CHANGED','Prepared source changed');
+   sources[f.path]=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
+  }
   for(const f of preparation.files.filter(f=>f.path!=='package.json')){
    const index=records.length,record={source:f.path,sourceSha256:f.sha256};
    try {
-    const bytes=await readBytes(path.join(root,f.outputPath),2*1024*1024);
-    if(SHA(bytes)!==f.sha256)throw error('PREPARED_SOURCE_CHANGED','Prepared source changed');
-    const contract=discover(new TextDecoder('utf-8',{fatal:true}).decode(bytes),f.path,evidence);
+    const contract=discoverCombined(sources,f.path,evidence);
     const contractPath=`contracts/${String(index).padStart(3,'0')}.json`;
     await fs.writeFile(path.join(root,contractPath),JSON.stringify(contract,null,2)+'\n',{flag:'wx',mode:0o600});
     const reasons={};for(const item of contract.unsupported)reasons[item.reason]=(reasons[item.reason]||0)+1;
