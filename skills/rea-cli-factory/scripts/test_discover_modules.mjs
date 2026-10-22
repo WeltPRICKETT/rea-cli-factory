@@ -7,7 +7,7 @@ import {discoverModules} from './discover_modules.mjs';
 function evidence(sources) {
   const nodes=[];
   for(const [source,text] of Object.entries(sources)) {
-    const ast=parse(text,{sourceType:'script'}), digest=createHash('sha256').update(text).digest('hex');
+    const ast=parse(text,{sourceType:'unambiguous'}), digest=createHash('sha256').update(text).digest('hex');
     const observation=(node,properties)=>({properties,evidence:{artifact:{available:true,sha256:digest},location:{available:true,value:{kind:'source-range',source,start:{line:node.loc.start.line,column:node.loc.start.column},end:{line:node.loc.end.line,column:node.loc.end.column}}}}});
     nodes.push({kind:'source',observations:[observation(ast.program,{})]});
     function walk(n) {
@@ -173,4 +173,82 @@ test('ignored unknown initializers and expressions may not hide getters or failu
 test('factory returns with eagerly evaluated unknown properties are rejected',()=>{
   const main=entry.replace('return {read(path)', 'return {metadata:external.config,read(path)');
   assert.equal(run(fixture(main)).candidates.length,0);
+});
+
+const esmHeader="import {contextBridge as bridge,ipcRenderer as ipc} from 'electron';";
+const gatewayObject="const api={ipc:{invoke(channel,...args){return ipc.invoke(channel,...args);},send(channel,...args){ipc.send(channel,...args);}},get metadata(){return external.value;}};";
+const isolationExposure="if(process.contextIsolated){try{bridge.exposeInMainWorld('sample',api);}catch(error){console.error(error);}}else{window.sample=api;}";
+
+test('ESM named Electron imports and namespace imports retain literal methods',()=>{
+  for(const main of [esmHeader+"bridge.exposeInMainWorld('sample',{read:()=>ipc.invoke('sample:read')});", "import * as electron from 'electron';electron.contextBridge.exposeInMainWorld('sample',{read:()=>electron.ipcRenderer.invoke('sample:read')});"])
+    assert.equal(run(fixture(main)).candidates[0].channel,'sample:read');
+});
+test('bounded ESM relative imports and named/default/re-exports retain scopes',()=>{
+  const main=esmHeader+"import {read} from './facade.mjs';bridge.exposeInMainWorld('sample',{read});";
+  const files={'preload/main.cjs':main,'preload/facade.mjs':"export {default as read} from './wire.mjs';",'preload/wire.mjs':"import {ipcRenderer} from 'electron';export default function read(path){return ipcRenderer.invoke('sample:read',path);}"};
+  assert.equal(run(files).candidates[0].channel,'sample:read');
+  files['preload/wire.mjs']="import {ipcRenderer} from 'electron';export const read=(path)=>ipcRenderer.invoke('sample:read',path);";
+  files['preload/facade.mjs']="export {read} from './wire.mjs';";
+  assert.equal(run(files).candidates.length,1);
+  files['preload/facade.mjs']="export * from './wire.mjs';";
+  assert.throws(()=>run(files),/UNSUPPORTED_ESM_EXPORT/);
+});
+test('conditional ESM gateway is unbound and preserves both availability branches',()=>{
+  const r=run(fixture(esmHeader+gatewayObject+isolationExposure));
+  assert.equal(r.candidates.length,0);assert.equal(r.gateways.length,2);
+  const g=r.gateways[0];assert.deepEqual(g.apiPath,['sample','ipc','invoke']);assert.equal(g.status,'gateway-unbound');assert.equal(g.channelParameterIndex,0);assert.equal(g.restParameter,'args');assert.equal(g.provenance.reaResolution,'dynamic');
+  assert.deepEqual(g.availability,{kind:'conditional',condition:'process.contextIsolated',branches:[{value:true,exposure:'contextBridge'},{value:false,exposure:'window'}],runtimeCheck:'api-path-exists'});
+});
+test('one conditional branch is recorded without claiming unconditional availability',()=>{
+  const main=esmHeader+"const api={read:()=>ipc.invoke('sample:read')};if(process.contextIsolated){bridge.exposeInMainWorld('sample',api);}";
+  const r=run(fixture(main));assert.equal(r.candidates.length,1);assert.deepEqual(r.candidates[0].availability.branches,[{value:true,exposure:'contextBridge'}]);
+});
+test('gateway discovery rejects transformed, truncated or duplicated rest payloads',()=>{
+  for(const args of ['channel,args[0]','channel,args','channel,...args,...args','other,...args','channel,{args}','channel,...args.map(x=>x)']) {
+    const main=esmHeader+gatewayObject.replace('ipc.invoke(channel,...args)','ipc.invoke('+args+')')+isolationExposure;
+    assert.ok(!run(fixture(main)).gateways.some(g=>g.transport==='invoke'),args);
+  }
+  for(const prefix of ['sideEffect();','const ignored=external.value;','ipc.send("other");']) {
+    const main=esmHeader+gatewayObject.replace('return ipc.invoke',prefix+'return ipc.invoke')+isolationExposure;
+    assert.ok(!run(fixture(main)).gateways.some(g=>g.transport==='invoke'),prefix);
+  }
+});
+test('conditional exposures reject unknown conditions, alternate objects and shadowed globals',()=>{
+  for(const main of [
+    esmHeader+gatewayObject+isolationExposure.replace('process.contextIsolated','unknown'),
+    esmHeader+gatewayObject+isolationExposure.replace('window.sample=api','window.sample=other'),
+    esmHeader+'const process=external;'+gatewayObject+isolationExposure,
+    esmHeader+'const window=external;'+gatewayObject+isolationExposure,
+    esmHeader+gatewayObject+isolationExposure+"window.sample=other;",
+    esmHeader+gatewayObject+isolationExposure+"window.sample.ipc.invoke=other;",
+    esmHeader+gatewayObject+isolationExposure+"process.contextIsolated=false;",
+    esmHeader+gatewayObject+isolationExposure.replace('console.error(error);',"bridge.exposeInMainWorld('sample',other);"),
+    esmHeader+gatewayObject+isolationExposure.replace('try{', 'try{const api=other;'),
+    esmHeader+gatewayObject+isolationExposure+'const win=window;win.sample=other;',
+    esmHeader+gatewayObject+isolationExposure+'const proc=process;proc.contextIsolated=false;'
+  ]) {
+    try {assert.equal(run(fixture(main)).gateways.length,0,main);} catch(error) {if(error instanceof SyntaxError)continue;throw error;}
+  }
+});
+test('inert getter leaves do not poison safe direct siblings, and payload getters still reject',()=>{
+  const main=esmHeader+"const api={read:()=>ipc.invoke('sample:read'),get metadata(){return sideEffect();}};bridge.exposeInMainWorld('sample',api);";
+  assert.equal(run(fixture(main)).candidates.length,1);
+  const payload=main.replace("ipc.invoke('sample:read')", "ipc.invoke('sample:read',api)");
+  assert.equal(run(fixture(payload)).candidates.length,0);
+});
+test('ESM mutation and evidence gates also apply to unbound gateways',()=>{
+  const main=esmHeader+gatewayObject+isolationExposure;
+  for(const change of ['ipc.invoke=other;','api.ipc.invoke=other;','leak(api);','const alias=api.ipc;alias.invoke=other;'])assert.equal(run(fixture(main+change)).gateways.filter(g=>g.transport==='invoke').length,0,change);
+  const s=fixture(main),ev=evidence(s);ev.normalized_result.graph.nodes=ev.normalized_result.graph.nodes.filter(n=>n.kind!=='ipc-channel');assert.equal(run(s,ev).gateways.length,0);
+});
+
+test('factory accessor leaves stay inert, but reads and writes invalidate discovery',()=>{
+  const main=esmHeader+"function factory(){return {read:()=>ipc.invoke('sample:read'),get metadata(){return sideEffect();}}}const api=factory();bridge.exposeInMainWorld('sample',api);";
+  assert.equal(run(fixture(main)).candidates.length,1);
+  assert.ok(run(fixture(main)).unsupported.some(u=>u.reason==='unsupported-accessor'));
+  for(const mutation of ['const alias=api.metadata;','api.metadata=other;'])assert.equal(run(fixture(main+mutation)).candidates.length,0,mutation);
+});
+test('unsupported Electron siblings neither become gateways nor poison recognized IPC',()=>{
+  const main=esmHeader+gatewayObject.replace('get metadata()',"unsupported(channel,...args){return ipc.sendSync(channel,...args);},get metadata()")+isolationExposure;
+  const r=run(fixture(main));assert.equal(r.gateways.length,2);assert.ok(r.unsupported.some(u=>u.apiPath?.at(-1)==='unsupported'));
 });

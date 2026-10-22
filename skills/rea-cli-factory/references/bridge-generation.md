@@ -20,7 +20,7 @@ node skills/rea-cli-factory/scripts/discover_bridge.mjs \
 
 参考 [盲测与人工介入记录](blind-evaluation.md)，可以先运行 `analyze_electron.mjs`，自动完成有界输入准备、调用指定已安装 REA、对每个选中文件提取并汇总。准备器用 Python 标准库解析 ASAR，无需临时编写提取代码或新增解包依赖。支持唯一声明且未修改的顶层 `const`、`let`、`var` Electron 绑定；仍拒绝重复声明、遮蔽、修改和逃逸。
 
-汇总为 candidate、blocked 或 incomplete，不表示 CLI 已生成。流水线会结合单文件提取与 [模块/工厂解析](module-resolution.md)，合并一致的方法，拒绝冲突描述；没有证据支持的导入包装器、工厂对象等仍输出缺口，不执行源码。既有 REA 结果可调用导出的 `discoverCombined(sources, entryName, evidence)` 复用，其中 sources 是精选相对路径到 UTF-8 源码的映射，不必重复分析。
+汇总为 candidate、blocked 或 incomplete，不表示 CLI 已生成。流水线会结合单文件提取与 [模块/工厂解析](module-resolution.md)，以模块安全判断为准，拒绝冲突描述；没有证据支持的导入包装器、工厂对象等仍输出缺口，不执行源码。既有 REA 结果可调用导出的 `discoverCombined(sources, entryName, evidence)` 复用，其中 sources 是精选相对路径到 UTF-8 源码的映射，不必重复分析。
 
 ## 显式选择与生成
 
@@ -35,7 +35,9 @@ node skills/rea-cli-factory/scripts/generate_bridge_cli.mjs \
   --out /private/new-adapter
 ```
 
-生成器拒绝覆盖已有目录。产物包含通用运行器、固定基线、仅含显式选择方法的配置和 CLI 入口；这些实例属于应用专用适配器，默认不进入公开仓库。运行器调用原 preload 方法，不拼造 IPC channel 调用，不执行提取源码。
+应用使用自定义本地协议时，须先检查协议处理器确实把目标 URL 映射到包内资源，再显式提供 `--local-scheme <scheme>`。生成器要求 URL 路径位于该应用 Resources 下；运行时仍逐字核对完整 URL。拒绝 HTTP(S)、凭据、端口、非规范路径及未显式指定的自定义协议；URL 外形本身不能证明页面内容来自本地。
+
+生成器拒绝覆盖已有目录。产物包含通用运行器、固定基线、仅含显式选择方法的配置和 CLI 入口；这些实例属于应用专用适配器，默认不进入公开仓库。运行器调用原 preload 方法，不执行提取源码。对于 [已绑定 gateway](gateway-binding.md)，配置区分业务命令 apiPath 与原桥接 targetPath，并只在参数前添加已证实的固定通道；原方法仍负责实际 IPC 调用。
 
 ## 运行会话与结果
 

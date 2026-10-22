@@ -29,7 +29,7 @@ REA 进程总时限 180 秒，单文件分析参数为 60 秒；stdout 最多 64
 - 退出码 3、`blocked`：没有候选；`incomplete`：某些文件存在提取错误，即使其他文件有候选也不能当作整体成功。
 - 退出码 2：准备或分析阶段失败，若已创建目录则保留阶段失败记录。
 
-`unsupported` 会保留源码位置和具体原因。[模块解析器](module-resolution.md) 可以处理限定的 CommonJS 包装器、工厂和静态通道表；未解析的 Electron 别名、动态业务通道、复杂对象组装、无暴露 API 等仍有缺口。不能通过执行所分析源码、猜测通道或降低证据要求，把这些条目变成候选。ESM、条件暴露或只提供任意通道转发器的应用不属于已验证子集。
+`unsupported` 会保留源码位置和具体原因。[模块解析器](module-resolution.md) 可以处理限定的 CommonJS 包装器、工厂和静态通道表；未解析的 Electron 别名、动态业务通道、复杂对象组装、无暴露 API 等仍有缺口。不能通过执行所分析源码、猜测通道或降低证据要求，把这些条目变成候选。ESM 与限定条件暴露参见模块边界。发现通用 gateway 后进入 [业务通道绑定](gateway-binding.md)：只按包内 HTML 的本地 script src 选择 renderer 入口，不自动追踪懒加载 chunk。两阶段分别保留清单、REA 与计时；未绑定 gateway 仍不能生成 CLI。Renderer 单文件上限 8 MiB、总计 16 MiB，HTML 单个 1 MiB、总计 2 MiB、最多 64 个；外链或不安全路径拒绝。
 
 ## 后续与计时
 

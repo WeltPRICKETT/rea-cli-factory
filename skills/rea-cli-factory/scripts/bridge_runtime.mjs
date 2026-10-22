@@ -13,14 +13,27 @@ export async function readBytes(file,max=1024*1024){
 export async function readJson(file,max=1024*1024){return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(await readBytes(file,max)));}
 export function validateMethod(m){
  if(!m||!Array.isArray(m.apiPath)||m.apiPath.length<2||m.apiPath.length>8||!m.apiPath.every(ident)||!Array.isArray(m.params)||!m.params.every(ident)||new Set(m.params).size!==m.params.length||m.arity!==m.params.length||!Number.isInteger(m.arity)||m.arity>16||!['send','invoke'].includes(m.transport)||m.status!=='candidate')throw error('INVALID_METHOD','Unsupported method contract');
+ // Gateway commands carry an immutable channel prefix, never a caller-supplied channel.
+ if(m.targetPath!==undefined||m.boundArgs!==undefined){
+  if(!Array.isArray(m.targetPath)||m.targetPath.length<2||m.targetPath.length>8||!m.targetPath.every(ident)||!Array.isArray(m.boundArgs)||m.boundArgs.length!==1||typeof m.channel!=='string'||!m.channel||m.channel.length>240||m.boundArgs[0]!==m.channel)throw error('INVALID_METHOD','Gateway commands require one fixed channel and target path');
+ }
  return m;
 }
-export function buildExpression(method,args,pageUrl){
- if(typeof pageUrl!=='string'||!pageUrl.startsWith('file://'))throw error('INVALID_PAGE','Fixed local page required');
+export function validatePage(pageUrl,appPath,localScheme){
+ let page;try{page=new URL(pageUrl);}catch{throw error('INVALID_PAGE','Fixed local resource URL required');}
+ const custom=typeof localScheme==='string'&&/^[a-z][a-z0-9+.-]{1,31}$/.test(localScheme)&&!['file','http','https','ws','wss','data','javascript','ftp','blob'].includes(localScheme)&&page.protocol===localScheme+':'&&page.host;
+ if(page.username||page.password||page.port||!(page.protocol==='file:'&&!page.host&&!localScheme||custom))throw error('INVALID_PAGE','Explicit local scheme or file URL required');
+ let decoded;try{decoded=decodeURIComponent(page.pathname);}catch{throw error('INVALID_PAGE','Invalid resource encoding');}
+ if(/%2f|%5c|%00/i.test(page.pathname)||decoded.includes('\\')||decoded.includes('\0')||path.posix.normalize(decoded)!==decoded)throw error('INVALID_PAGE','Noncanonical resource path');
+ if(appPath){const root=path.join(appPath,'Contents/Resources')+path.sep;if(!decoded.startsWith(root))throw error('INVALID_PAGE','Resource path must belong to the selected application');}
+ return page.href;
+}
+export function buildExpression(method,args,pageUrl,localScheme){
+ validatePage(pageUrl,undefined,localScheme);
  validateMethod(method);
  if(!Array.isArray(args)||args.length!==method.arity)throw error('INVALID_ARGUMENTS',`Expected ${method.arity} positional JSON arguments`);
- const encoded=JSON.stringify(args);if(encoded.length>1024*1024)throw error('INPUT_LIMIT','Arguments too large');
- return `(async()=>{if(window.location.href!==${JSON.stringify(pageUrl)})throw new Error('PAGE_CHANGED');const keys=${JSON.stringify(method.apiPath)};let owner=window;for(const key of keys.slice(0,-1)){if(owner==null)throw new Error('BRIDGE_UNAVAILABLE');owner=owner[key];}const fn=owner?.[keys[keys.length-1]];if(typeof fn!=='function')throw new Error('BRIDGE_UNAVAILABLE');const value=await Reflect.apply(fn,owner,${encoded});return {hasValue:value!==undefined,value:value===undefined?null:value};})()`;
+ const encoded=JSON.stringify([...(method.boundArgs||[]),...args]);if(encoded.length>1024*1024)throw error('INPUT_LIMIT','Arguments too large');
+ return `(async()=>{if(window.location.href!==${JSON.stringify(pageUrl)})throw new Error('PAGE_CHANGED');const keys=${JSON.stringify(method.targetPath||method.apiPath)};let owner=window;for(const key of keys.slice(0,-1)){if(owner==null)throw new Error('BRIDGE_UNAVAILABLE');owner=owner[key];}const fn=owner?.[keys[keys.length-1]];if(typeof fn!=='function')throw new Error('BRIDGE_UNAVAILABLE');const value=await Reflect.apply(fn,owner,JSON.parse(${JSON.stringify(encoded)}));return {hasValue:value!==undefined,value:value===undefined?null:value};})()`;
 }
 export function validateSession(s,config){
  if(!s||s.schema!=='rea-cli-factory.local-session.v1'||!Number.isInteger(s.pid)||s.pid<1||!Number.isInteger(s.port)||s.port<1||s.port>65535||typeof s.targetId!=='string'||!/^[A-Za-z0-9_-]{1,128}$/.test(s.targetId)||s.appPath!==config.appPath||typeof s.profile!=='string'||!path.isAbsolute(s.profile)||s.profile.includes('\n')||s.pageUrl!==config.pageUrl)throw error('INVALID_SESSION','Session does not match the fixed target');
@@ -57,8 +70,9 @@ export async function assertLocalIdentity(session,config,dir){
 export async function callMethod(config,session,method,args,dir,deps={}){
  validateSession(session,config);validateMethod(method);
  const selected=(config.methods||[]).filter(m=>m.apiPath.join('.')===method.apiPath.join('.'));
- if(selected.length!==1||['arity','transport','channel','params'].some(k=>JSON.stringify(selected[0][k])!==JSON.stringify(method[k])))throw error('METHOD_NOT_SELECTED','Only the exact selected descriptor may run');
- const expression=buildExpression(selected[0],args,config.pageUrl);
+ if(selected.length!==1||['arity','transport','channel','params','targetPath','boundArgs'].some(k=>JSON.stringify(selected[0][k])!==JSON.stringify(method[k])))throw error('METHOD_NOT_SELECTED','Only the exact selected descriptor may run');
+ validatePage(config.pageUrl,config.appPath,config.localScheme);
+ const expression=buildExpression(selected[0],args,config.pageUrl,config.localScheme);
  await (deps.identity||assertLocalIdentity)(session,config,dir);
  const list=await (deps.targets|| (async()=>{const r=await fetch(`http://127.0.0.1:${session.port}/json/list`,{signal:AbortSignal.timeout(3000)});if(!r.ok)throw error('TARGET_LIST_FAILED','Cannot inspect selected target');return r.json();}))();
  const target=selectTarget(list,session),client=await (deps.connect||connect)(target);

@@ -75,6 +75,59 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(self.asar.read_bytes(), original)
         self.assertEqual(json.loads((self.out / 'preparation.json').read_text()), result)
 
+    def test_renderer_html_selects_only_script_entries_with_archive_provenance(self):
+        self.files.update({'dist/renderer/index.html': b'<script type="module" src="./assets/main.js?v=1"></script>',
+                           'dist/renderer/assets/main.js': b'const text="' + b'a' * (2 * 1024**2) + b'";',
+                           'dist/renderer/assets/unreferenced.js': b'must not select'})
+        self.write()
+        result = preparation.prepare(self.asar, self.out, renderer_entrypoints=True)
+        self.assertEqual([f['path'] for f in result['files']], ['dist/renderer/assets/main.js', 'package.json'])
+        self.assertEqual(result['selection']['policy'], 'packaged-html-script-src-v1')
+        html = result['htmlEntrypoints'][0]
+        self.assertEqual(html['sha256'], hashlib.sha256(self.files[html['path']]).hexdigest())
+        self.assertEqual(html['scripts'][0]['resolved'], 'dist/renderer/assets/main.js')
+        self.assertEqual((self.out / result['files'][0]['outputPath']).read_bytes(), self.files['dist/renderer/assets/main.js'])
+
+    def test_renderer_rejects_external_traversal_missing_and_base_entries(self):
+        for src, code in [('https://example.test/a.js', 'EXTERNAL_RENDERER_ENTRY'),
+                          ('//example.test/a.js', 'EXTERNAL_RENDERER_ENTRY'),
+                          ('../a.js', 'UNSAFE_RENDERER_ENTRY'),
+                          ('%2e%2e/a.js', 'UNSAFE_RENDERER_ENTRY'),
+                          ('a.js', 'RENDERER_ENTRY_MISSING')]:
+            with self.subTest(src=src):
+                self.write(files={**self.files, 'index.html': f'<script src="{src}"></script>'.encode()})
+                with self.assertRaises(preparation.PreparationError) as error:
+                    preparation.prepare(self.asar, self.out, renderer_entrypoints=True)
+                self.assertEqual(error.exception.code, code)
+                self.assertFalse(self.out.exists())
+        self.write(files={**self.files, 'index.html': b'<base href="./"><script src="a.js"></script>'})
+        with self.assertRaises(preparation.PreparationError) as error:
+            preparation.prepare(self.asar, self.out, renderer_entrypoints=True)
+        self.assertEqual(error.exception.code, 'UNSUPPORTED_HTML_BASE')
+
+    def test_renderer_link_and_unpacked_entrypoints_rejected(self):
+        for entry, code in [({'link': 'elsewhere.js'}, 'UNSUPPORTED_LINK'),
+                            ({'size': 10, 'unpacked': True}, 'UNSUPPORTED_UNPACKED')]:
+            tree, payload = file_tree({**self.files, 'index.html': b'<script src="entry.js"></script>'})
+            tree['files']['entry.js'] = entry
+            self.write(header=tree, payload=payload)
+            with self.assertRaises(preparation.PreparationError) as error:
+                preparation.prepare(self.asar, self.out, renderer_entrypoints=True)
+            self.assertEqual(error.exception.code, code)
+
+    def test_renderer_limits_and_missing_html_are_explicit(self):
+        self.write()
+        with self.assertRaises(preparation.PreparationError) as error:
+            preparation.prepare(self.asar, self.out, renderer_entrypoints=True)
+        self.assertEqual(error.exception.code, 'NO_RENDERER_ENTRYPOINTS')
+        self.write(files={**self.files, 'index.html': b'<script src="entry.js"></script>', 'entry.js': b'const x=1;'})
+        for limit, code in [('MAX_RENDERER_FILE_BYTES', 'SOURCE_TOO_LARGE'), ('MAX_HTML_BYTES', 'HTML_SELECTION_TOO_LARGE'), ('MAX_HTML_TOTAL_BYTES', 'HTML_SELECTION_TOO_LARGE')]:
+            with self.subTest(limit=limit), patch.object(preparation, limit, 1):
+                with self.assertRaises(preparation.PreparationError) as error:
+                    preparation.prepare(self.asar, self.out, renderer_entrypoints=True)
+                self.assertEqual(error.exception.code, code)
+                self.assertFalse(self.out.exists())
+
     def test_existing_output_never_overwritten(self):
         self.write()
         self.out.mkdir()

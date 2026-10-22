@@ -8,21 +8,28 @@ import {performance} from 'node:perf_hooks';
 import {createHash} from 'node:crypto';
 import {discover} from './discover_bridge.mjs';
 import {discoverModules} from './discover_modules.mjs';
+import {bindGateways} from './bind_gateway.mjs';
 import {readBytes,readJson,error} from './bridge_runtime.mjs';
 const HERE=path.dirname(fileURLToPath(import.meta.url));
 const SHA=b=>createHash('sha256').update(b).digest('hex');
 
 export function discoverCombined(sources,name,evidence){
- const direct=discover(sources[name],name,evidence),modules=discoverModules(sources,name,evidence);
- const methods=new Map(),conflicts=new Set();
- for(const candidate of [...direct.candidates,...modules.candidates]){
+ const modules=discoverModules(sources,name,evidence);
+ let direct;
+ try{direct=discover(sources[name],name,evidence);}catch(e){
+  // Legacy script parsing may fail on valid ESM; a successful module pass is authoritative.
+  if(e.code!=='SOURCE_PARSE_FAILED')throw e;
+  direct={candidates:[],unsupported:[]};
+ }
+ // The scoped module pass owns admission. Legacy discovery can veto a conflict,
+ // but cannot restore a method rejected because its exposed object was mutated.
+ const methods=new Map(modules.candidates.map(candidate=>[candidate.apiPath.join('.'),candidate])),conflicts=new Set();
+ for(const candidate of direct.candidates){
   const key=candidate.apiPath.join('.'),existing=methods.get(key);
   if(existing&&['params','arity','transport','channel'].some(k=>JSON.stringify(existing[k])!==JSON.stringify(candidate[k])))conflicts.add(key);
-  methods.set(key,candidate);
  }
  for(const key of conflicts)methods.delete(key);
- const names=new Set(methods.keys());
- const unsupported=[...(modules.candidates.length?modules.unsupported:direct.unsupported),...Array.from(conflicts,name=>({reason:'conflicting-static-descriptors',apiPath:name.split('.')}))].filter(x=>!x.apiPath||!names.has(x.apiPath.join('.')));
+ const unsupported=[...modules.unsupported,...Array.from(conflicts,name=>({reason:'conflicting-static-descriptors',apiPath:name.split('.')}))];
  return {...modules,candidates:[...methods.values()],unsupported,analysis:{...modules.analysis,directCandidates:direct.candidates.length,moduleCandidates:modules.candidates.length,conflicts:conflicts.size}};
 }
 
@@ -50,7 +57,7 @@ const ADVICE={
  'no-exposed-api':'No supported static exposure in this selected file; this does not prove absence in the application.'
 };
 export async function analyze({asar,reaCli,out}) {
- const root=path.resolve(out),start=performance.now(),timings={},toolFiles=['analyze_electron.mjs','prepare_electron.py','discover_bridge.mjs','discover_modules.mjs'];
+ const root=path.resolve(out),start=performance.now(),timings={},toolFiles=['analyze_electron.mjs','prepare_electron.py','discover_bridge.mjs','discover_modules.mjs','bind_gateway.mjs'];
  // Caller selects the installed analyzer; never download or execute the app here.
  const reaPath=await fs.realpath(reaCli),reaStat=await fs.stat(reaPath);
  if(!reaStat.isFile()||!['.js','.mjs','.cjs'].includes(path.extname(reaPath)))throw error('INVALID_ANALYZER','Select the installed REA JavaScript CLI file');
@@ -72,7 +79,7 @@ export async function analyze({asar,reaCli,out}) {
   if(r.code!==0)throw error('REA_FAILED','REA did not finish successfully; raw output retained');
   const evidence=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(r.stdout));
   timings.reaMs=Math.round(performance.now()-t);phase='discover';t=performance.now();
-  const records=[],sources={};await fs.mkdir(path.join(root,'contracts'),{mode:0o700});
+  const records=[],contracts=new Map(),sources={};await fs.mkdir(path.join(root,'contracts'),{mode:0o700});
   for(const f of preparation.files.filter(f=>f.path!=='package.json')){
    const bytes=await readBytes(path.join(root,f.outputPath),2*1024*1024);
    if(SHA(bytes)!==f.sha256)throw error('PREPARED_SOURCE_CHANGED','Prepared source changed');
@@ -83,16 +90,59 @@ export async function analyze({asar,reaCli,out}) {
    try {
     const contract=discoverCombined(sources,f.path,evidence);
     const contractPath=`contracts/${String(index).padStart(3,'0')}.json`;
-    await fs.writeFile(path.join(root,contractPath),JSON.stringify(contract,null,2)+'\n',{flag:'wx',mode:0o600});
+    contracts.set(contractPath,contract);
     const reasons={};for(const item of contract.unsupported)reasons[item.reason]=(reasons[item.reason]||0)+1;
-    if(!contract.candidates.length&&!contract.unsupported.length)reasons['no-static-exposure']=1;
-    Object.assign(record,{status:contract.candidates.length?'candidate':'unsupported',candidates:contract.candidates.length,unsupported:contract.unsupported.length,reasons,contract:contractPath,methods:contract.candidates.map(m=>({name:m.apiPath.join('.'),params:m.params})),nextSteps:[...new Set(contract.unsupported.map(item=>item.nextStep||ADVICE[item.reason]||'Review the recorded source range; this structure is outside the supported subset.'))]});
+    if(!contract.candidates.length&&!contract.gateways?.length&&!contract.unsupported.length)reasons['no-static-exposure']=1;
+    Object.assign(record,{status:contract.candidates.length?'candidate':contract.gateways?.length?'gateway-unbound':'unsupported',candidates:contract.candidates.length,gateways:contract.gateways?.length||0,unsupported:contract.unsupported.length,reasons,contract:contractPath,methods:contract.candidates.map(m=>({name:m.apiPath.join('.'),params:m.params})),nextSteps:[...new Set(contract.unsupported.map(item=>item.nextStep||ADVICE[item.reason]||'Review the recorded source range; this structure is outside the supported subset.'))]});
    }catch(e){Object.assign(record,{status:'error',error:{code:e.code||'INVALID_SOURCE'},nextSteps:['Inspect this source/evidence mismatch before retrying; do not substitute guessed methods.']});}
    records.push(record);
   }
-  timings.discoverMs=Math.round(performance.now()-t);timings.totalMs=Math.round(performance.now()-start);
-  const count=records.reduce((n,r)=>n+(r.candidates||0),0),failed=records.some(r=>r.status==='error');
-  const report={schema:'rea-cli-factory.electron-analysis.v1',ok:count>0&&!failed,status:failed?'incomplete':count?'candidate':'blocked',candidateCount:count,verified:false,runtimeObserved:false,evidenceId:evidence.evidence_id,coverage:evidence.normalized_result?.graph?.coverage,records,timings,limitations:['Candidate-only selected-source analysis, not a generated or verified app CLI.','Zero candidates stops here; no application is launched and no interface is guessed.','Choose task methods, review semantics and lifecycle, then generate a private CLI and verify real readback.','A replay after inspection or tool changes is not a fresh blind test.']};
+  timings.discoverMs=Math.round(performance.now()-t);
+  const gatewayCount=records.reduce((n,r)=>n+(r.gateways||0),0),rendererPhase={status:'not-needed',gatewayCount};
+  if(gatewayCount){
+   phase='renderer-prepare';t=performance.now();
+   const rendererRoot=path.join(root,'renderer');
+   try{
+    const prepared=await runBounded('python3',[path.join(HERE,'prepare_electron.py'),'--asar',path.resolve(asar),'--out',rendererRoot,'--renderer-entrypoints'],{timeoutMs:60000,maxOutput:1024*1024});
+    timings.rendererPrepareMs=Math.round(performance.now()-t);
+    if(prepared.code!==0){let code='RENDERER_PREPARATION_FAILED';try{code=JSON.parse(prepared.stdout).error.code;}catch{}throw error(code,'Renderer source selection failed');}
+    const rendererPreparation=await readJson(path.join(rendererRoot,'preparation.json'),4*1024*1024);
+    if(rendererPreparation.archive.sha256!==preparation.archive.sha256)throw error('ARCHIVE_CHANGED','Application archive changed between analysis phases');
+    Object.assign(rendererPhase,{preparation:'renderer/preparation.json',selectedFiles:rendererPreparation.selection.selectedFiles,archiveSha256:rendererPreparation.archive.sha256});
+    phase='renderer-rea';t=performance.now();
+    let rendererRun;
+    try{rendererRun=await runBounded(process.execPath,[reaPath,'analyze-javascript-application',path.join(rendererRoot,'sources'),'--artifact-format','directory','--analysis-timeout-ms','60000','--format','json']);}
+    catch(e){if(e.result){await fs.writeFile(path.join(rendererRoot,'rea-partial.stdout'),e.result.stdout,{flag:'wx',mode:0o600});await fs.writeFile(path.join(rendererRoot,'rea.stderr'),e.result.stderr,{flag:'wx',mode:0o600});}throw e;}
+    await fs.writeFile(path.join(rendererRoot,'rea-evidence.json'),rendererRun.stdout,{flag:'wx',mode:0o600});
+    await fs.writeFile(path.join(rendererRoot,'rea.stderr'),rendererRun.stderr,{flag:'wx',mode:0o600});
+    if(rendererRun.code!==0)throw error('RENDERER_REA_FAILED','Renderer analysis failed; evidence retained');
+    const rendererEvidence=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(rendererRun.stdout));
+    timings.rendererReaMs=Math.round(performance.now()-t);
+    Object.assign(rendererPhase,{evidence:'renderer/rea-evidence.json',evidenceId:rendererEvidence.evidence_id,coverage:rendererEvidence.normalized_result?.graph?.coverage});
+    const rendererSources={};
+    for(const f of rendererPreparation.files.filter(f=>f.path!=='package.json')){
+     const bytes=await readBytes(path.join(rendererRoot,f.outputPath),8*1024*1024);
+     if(SHA(bytes)!==f.sha256)throw error('PREPARED_SOURCE_CHANGED','Renderer source changed');
+     rendererSources[f.path]=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
+    }
+    phase='gateway-bind';t=performance.now();
+    for(const record of records.filter(r=>r.gateways)){
+     const contract=bindGateways(rendererSources,contracts.get(record.contract),rendererEvidence);
+     contracts.set(record.contract,contract);
+     record.candidates=contract.candidates.length;
+     record.status=record.candidates?'candidate':'gateway-unbound';
+     record.methods=contract.candidates.map(m=>({name:m.apiPath.join('.'),params:m.params}));
+     record.unsupported=contract.unsupported.length;
+     record.reasons={};for(const item of contract.unsupported)record.reasons[item.reason]=(record.reasons[item.reason]||0)+1;
+    }
+    timings.gatewayBindMs=Math.round(performance.now()-t);
+    rendererPhase.status=records.some(r=>r.gateways&&r.candidates)?'bound':'unbound';
+   }catch(e){Object.assign(rendererPhase,{status:'blocked',phase,error:{code:e.code||'INVALID_RENDERER_ANALYSIS'},nextStep:'Inspect retained gateway and renderer evidence; never expose an unrestricted channel argument.'});}
+  }
+  for(const [contractPath,contract] of contracts)await fs.writeFile(path.join(root,contractPath),JSON.stringify(contract,null,2)+'\n',{flag:'wx',mode:0o600});
+  timings.totalMs=Math.round(performance.now()-start);
+  const count=records.reduce((n,r)=>n+(r.candidates||0),0),failed=records.some(r=>r.status==='error')||(rendererPhase.status==='blocked'&&!['NO_RENDERER_ENTRYPOINTS','RENDERER_ENTRY_MISSING'].includes(rendererPhase.error?.code));
+  const report={schema:'rea-cli-factory.electron-analysis.v1',ok:count>0&&!failed,status:failed?'incomplete':count?'candidate':'blocked',candidateCount:count,gatewayCount,rendererPhase,verified:false,runtimeObserved:false,evidenceId:evidence.evidence_id,coverage:evidence.normalized_result?.graph?.coverage,records,timings,limitations:['Candidate-only selected-source analysis, not a generated or verified app CLI.','Zero candidates stops here; no application is launched and no interface is guessed.','Choose task methods, review semantics and lifecycle, then generate a private CLI and verify real readback.','A replay after inspection or tool changes is not a fresh blind test.']};
   await fs.writeFile(path.join(root,'analysis-summary.json'),JSON.stringify(report,null,2)+'\n',{flag:'wx',mode:0o600});return report;
  }catch(e){if(began)await fs.writeFile(path.join(root,'analysis-failure.json'),JSON.stringify({ok:false,status:'blocked',phase,error:{code:e.code||'INVALID_ANALYSIS'},runtimeObserved:false,verified:false},null,2)+'\n',{flag:'wx',mode:0o600});throw e;}
 }

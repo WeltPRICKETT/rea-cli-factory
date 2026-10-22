@@ -5,7 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {parse} from '@babel/parser';
-import {analyze,runBounded} from './analyze_electron.mjs';
+import {analyze,runBounded,discoverCombined} from './analyze_electron.mjs';
+import {discover} from './discover_bridge.mjs';
+import {discoverModules} from './discover_modules.mjs';
 function archive(source){
  const files={'package.json':'{"name":"synthetic-fixture"}',...(typeof source==='string'?{'preload.js':source}:source)},tree={files:{}},chunks=[];let offset=0;
  for(const [name,text] of Object.entries(files)){let dir=tree;const parts=name.split('/');for(const part of parts.slice(0,-1))dir=dir.files[part]||=( {files:{}} );const bytes=Buffer.from(text);dir.files[parts.at(-1)]={size:bytes.length,offset:String(offset)};offset+=bytes.length;chunks.push(bytes);}
@@ -18,11 +20,11 @@ function evidence(source,name='preload.js'){
  const nodes=[],digest=createHash('sha256').update(source).digest('hex');
  const observation=(n,properties)=>({properties,evidence:{artifact:{available:true,sha256:digest},location:{available:true,value:{kind:'source-range',source:name,start:{line:n.loc.start.line,column:n.loc.start.column},end:{line:n.loc.end.line,column:n.loc.end.column}}}}});
  function walk(n){if(!n||typeof n!=='object')return;if(n.type==='CallExpression'&&n.callee?.property?.name==='invoke')nodes.push({kind:'ipc-channel',observations:[observation(n,{side:'renderer',operation:'invoke',resolution:n.arguments[0]?.type==='StringLiteral'?'literal':'dynamic',channel:n.arguments[0]?.value})]});for(const [k,v] of Object.entries(n))if(k!=='loc'){if(Array.isArray(v))v.forEach(walk);else if(v&&typeof v==='object')walk(v);}}
- const ast=parse(source);nodes.push({kind:'javascript-module',observations:[observation(ast.program,{})]});walk(ast);return {operation:'analyze_javascript_application',evidence_id:'ev_'+'f'.repeat(64),normalized_result:{graph:{nodes,coverage:{status:'complete',truncated:false}}}};
+ const ast=parse(source,{sourceType:'unambiguous'});nodes.push({kind:'javascript-module',observations:[observation(ast.program,{})]});walk(ast);return {operation:'analyze_javascript_application',evidence_id:'ev_'+'f'.repeat(64),normalized_result:{graph:{nodes,coverage:{status:'complete',truncated:false}}}};
 }
 async function fixture(fn){const dir=await fs.mkdtemp(path.join(os.tmpdir(),'factory-pipeline-'));try{await fn(dir);}finally{await fs.rm(dir,{recursive:true,force:true});}}
 const HEADER="const electron=require('electron');";
-async function inputs(dir,source,producer){const asar=path.join(dir,'fixture.asar'),reaCli=path.join(dir,'fake-rea.mjs');await fs.writeFile(asar,archive(source));let ev;if(typeof source==='string')ev=evidence(source);else{const parts=Object.entries(source).map(([name,text])=>evidence(text,name));ev=parts[0];ev.normalized_result.graph.nodes=parts.flatMap(p=>p.normalized_result.graph.nodes);}await fs.writeFile(reaCli,producer||`process.stdout.write(${JSON.stringify(JSON.stringify(ev))});`);return {asar,reaCli,out:path.join(dir,'result')};}
+async function inputs(dir,source,producer){const asar=path.join(dir,'fixture.asar'),reaCli=path.join(dir,'fake-rea.mjs');await fs.writeFile(asar,archive(source));let ev;if(typeof source==='string')ev=evidence(source);else{const parts=Object.entries(source).filter(([name])=>/\.(mjs|cjs|js)$/.test(name)).map(([name,text])=>evidence(text,name));ev=parts[0];ev.normalized_result.graph.nodes=parts.flatMap(p=>p.normalized_result.graph.nodes);}await fs.writeFile(reaCli,producer||`process.stdout.write(${JSON.stringify(JSON.stringify(ev))});`);return {asar,reaCli,out:path.join(dir,'result')};}
 test('prepared source to candidate report is one inert workflow, never a verified CLI',()=>fixture(async dir=>{
  const marker=path.join(dir,'must-not-exist');const source=HEADER+`require('node:fs').writeFileSync(${JSON.stringify(marker)},'executed');electron.contextBridge.exposeInMainWorld('fixture',{read:()=>electron.ipcRenderer.invoke('read')});`;
  const args=await inputs(dir,source);const result=await analyze(args);
@@ -64,4 +66,36 @@ test('timeout settles even when a detached descendant retains the output pipes',
   await assert.rejects(runBounded(process.execPath,['-e',"const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setTimeout(()=>{},10000)'],{stdio:['ignore',1,2],detached:true});console.log(child.pid);child.unref();"],{timeoutMs:300}),e=>{assert.equal(e.code,'ANALYSIS_TIMEOUT');descendant=Number(e.result.stdout.toString().trim());assert.ok(Number.isInteger(descendant)&&descendant>0);return true;});
   assert.ok(Date.now()-started<3000,'must not wait for descendant to close inherited pipes');
  }finally{if(descendant)try{process.kill(descendant,'SIGKILL');}catch{}}
+});
+
+const GATEWAY=`import {contextBridge,ipcRenderer} from 'electron';const api={ipcRenderer:{invoke(channel,...args){return ipcRenderer.invoke(channel,...args)}}};if(process.contextIsolated){try{contextBridge.exposeInMainWorld('desktop',api)}catch(error){console.error(error)}}else{window.desktop=api}`;
+const RENDERER='function connect(bridge){return bridge?new Proxy({},{get(target,namespace){return new Proxy({},{get(inner,method){return(...args)=>{const channel=`${namespace}.${method}`;return bridge.invoke(channel,...args)}}})}}):null}const client=connect(window.desktop?.ipcRenderer);client?.app.getVersion();';
+test('ESM gateway triggers deterministic renderer REA and binds fixed business channel',()=>fixture(async dir=>{
+ const args=await inputs(dir,{'preload.mjs':GATEWAY,'renderer/index.html':'<script type="module" src="./assets/main.js"></script>','renderer/assets/main.js':RENDERER});
+ const r=await analyze(args);assert.equal(r.status,'candidate');assert.equal(r.candidateCount,1);assert.equal(r.gatewayCount,1);assert.equal(r.rendererPhase.status,'bound');
+ const c=JSON.parse(await fs.readFile(path.join(args.out,r.records[0].contract)));assert.deepEqual(c.candidates[0].boundArgs,['app.getVersion']);assert.deepEqual(c.candidates[0].targetPath,['desktop','ipcRenderer','invoke']);
+ assert.ok(r.timings.rendererPrepareMs>=0);assert.ok(r.timings.rendererReaMs>=0);assert.ok(r.timings.gatewayBindMs>=0);
+ assert.ok((await fs.stat(path.join(args.out,'rea-evidence.json'))).isFile());assert.ok((await fs.stat(path.join(args.out,'renderer/rea-evidence.json'))).isFile());
+ const p=JSON.parse(await fs.readFile(path.join(args.out,'renderer/preparation.json')));assert.equal(p.files.find(f=>f.path.endsWith('main.js')).sha256,createHash('sha256').update(RENDERER).digest('hex'));
+}));
+test('unbound ESM gateways survive missing renderer entrypoints as explicit blocked metadata',()=>fixture(async dir=>{
+ const args=await inputs(dir,{'preload.mjs':GATEWAY});const r=await analyze(args);assert.equal(r.status,'blocked');assert.equal(r.candidateCount,0);assert.equal(r.gatewayCount,1);assert.equal(r.rendererPhase.error.code,'NO_RENDERER_ENTRYPOINTS');
+ const c=JSON.parse(await fs.readFile(path.join(args.out,r.records[0].contract)));assert.equal(c.gateways[0].status,'gateway-unbound');assert.equal(c.candidates.length,0);
+}));
+test('renderer analyzer failure preserves raw gateway and cannot become candidate success',()=>fixture(async dir=>{
+ const ev=evidence(GATEWAY,'preload.mjs');
+ const args=await inputs(dir,{'preload.mjs':GATEWAY,'renderer/index.html':'<script src="entry.js"></script>','renderer/entry.js':RENDERER},`if(process.argv[3].includes('/renderer/sources')){process.stderr.write('renderer failed');process.exitCode=9;}else process.stdout.write(${JSON.stringify(JSON.stringify(ev))});`);
+ const r=await analyze(args);assert.equal(r.status,'incomplete');assert.equal(r.ok,false);assert.equal(r.candidateCount,0);assert.equal(r.gatewayCount,1);assert.equal(r.rendererPhase.error.code,'RENDERER_REA_FAILED');
+ assert.equal(await fs.readFile(path.join(args.out,'renderer/rea.stderr'),'utf8'),'renderer failed');
+ const c=JSON.parse(await fs.readFile(path.join(args.out,r.records[0].contract)));assert.equal(c.gateways.length,1);
+}));
+
+test('legacy candidates cannot resurrect direct or aliased window mutations rejected by scoped discovery',()=>{
+ const prefix="const {contextBridge,ipcRenderer}=require('electron');const api={read:()=>ipcRenderer.invoke('sample:read')};contextBridge.exposeInMainWorld('sample',api);";
+ for(const mutation of ['window.sample={read:other};','const win=window;win.sample={read:other};']){
+  const source=prefix+mutation,ev=evidence(source),modules=discoverModules({'preload.js':source},'preload.js',ev),direct=discover(source,'preload.js',ev),combined=discoverCombined({'preload.js':source},'preload.js',ev);
+  assert.equal(direct.candidates.length,1,'fixture must reproduce the unsafe legacy admission');
+  assert.equal(modules.candidates.length,0);assert.ok(modules.unsupported.length,'module rejection must have a reason');
+  assert.equal(combined.candidates.length,0);assert.deepEqual(combined.unsupported,modules.unsupported,'scoped rejection reasons must be retained');
+ }
 });

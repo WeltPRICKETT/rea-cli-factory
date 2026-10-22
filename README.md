@@ -16,6 +16,7 @@ A task-oriented agent skill for turning application analysis into verified CLI a
 - [`scripts/check_compatibility.py`](skills/rea-cli-factory/scripts/check_compatibility.py)：对固定已验证清单做只读兼容性门禁。
 - [一次完成 ASAR 精选输入、REA 和接口提取](skills/rea-cli-factory/references/blind-evaluation.md)：冻结盲测输入、保留失败和人工介入边界。
 - [静态桥接提取与候选 CLI 生成](skills/rea-cli-factory/references/bridge-generation.md)：从 REA 对应源码自动提取方法和形参，只生成显式选中的调用入口。
+- [ESM、条件暴露与固定业务通道绑定](skills/rea-cli-factory/references/gateway-binding.md)。
 - [重启与升级协议](skills/rea-cli-factory/references/maintenance-validation.md)。
 - [多应用验证协议](skills/rea-cli-factory/references/multi-app-evaluation.md)、离线测试和 GitHub Actions。
 
@@ -61,7 +62,7 @@ npm ci --ignore-scripts
 npm test
 ```
 
-44 项 Python 回归覆盖身份摘要、内容变化、应用名歧义、路径穿越、符号链接越界、缺失文件、入口候选语义、有界扫描及 REA 摘要的查询、截断、输入错误与信息边界，以及升级变化拒绝、固定基线保护、恢复旧版和 ASAR 准备边界。另有 57 项 Node 测试覆盖静态映射、跨文件工厂/包装器、作用域与突变拒绝、候选生成、目标绑定、盲测流水线与有界失败处理。合计 101 项测试；测试本身不联网、不启动应用，不代表任意应用的自动适配能力。
+48 项 Python 与 108 项 Node 回归，共 156 项，覆盖身份摘要、升级失效、ASAR 有界选择、REA 证据关联、模块/工厂/ESM/条件暴露、固定业务通道、目标绑定与失败处理。测试本身不联网、不启动应用，不代表任意应用的自动适配能力。
 
 ## 多应用实测
 
@@ -71,7 +72,9 @@ npm test
 
 此前 [盲测记录](docs/blind-trial-2026-10-23.md) 保留 Miyo 筛选退出和 Tutti 首次失败。最新 [跨文件解析与新盲测](docs/module-resolution-2026-10-23.md) 已通过 Tutti 的生成 CLI 文本读取，随后冻结工具测试 Folo，保留其 ESM/条件暴露样本的首次失败。
 
-实验性通用工具，面向希望将重复 GUI 任务交给 Agent 的个人开发者。当前公开范围是工作流、清单和候选生成工具；具体应用适配器独立维护。优先级是可验证结果与明确失败，下一里程碑是 ESM/条件暴露与通用 IPC 总线的业务调用证据绑定，再用未见样本验证；不通过执行源码或手填映射绕过盲测失败。核心指标是正确性、人工介入次数、整体等待时间和维护成本；无可调用入口、结果不可验证或维护成本高于人工收益时停止该适配方向。
+最新 [ESM 与通道绑定试验](docs/esm-gateway-2026-10-23.md)：Folo 两个生成命令通过真实只读验证，但最终加固提取器因全局动态写入返回 blocked；Typeless 首次冻结盲测因混淆属性名返回 blocked。分别保留实测成功与自动提取失败，应用专用产物仍不公开。
+
+实验性通用工具，面向希望将重复 GUI 任务交给 Agent 的个人开发者。当前公开范围是工作流、清单和候选生成工具；具体应用适配器独立维护。优先级是可验证结果与明确失败，下一里程碑是补充全局写入的执行顺序证明与有界混淆字符串恢复，并继续减少生命周期和验收的人工准备；不通过执行源码或手填映射绕过盲测失败。核心指标是正确性、人工介入次数、整体等待时间和维护成本；无可调用入口、结果不可验证或维护成本高于人工收益时停止该适配方向。
 
 ## 许可证与来源
 

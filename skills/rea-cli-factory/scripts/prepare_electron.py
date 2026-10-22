@@ -2,6 +2,9 @@
 """Select bounded Electron preload sources from an ASAR without executing them."""
 import argparse
 import hashlib
+from html.parser import HTMLParser
+from urllib.parse import unquote, urlsplit
+import posixpath
 import json
 import os
 from pathlib import Path
@@ -18,6 +21,9 @@ MAX_DEPTH = 64
 MAX_SELECTED_FILES = 64
 MAX_FILE_BYTES = 2 * 1024**2
 MAX_SELECTED_BYTES = 16 * 1024**2
+MAX_RENDERER_FILE_BYTES = 8 * 1024**2
+MAX_HTML_BYTES = 1024**2
+MAX_HTML_TOTAL_BYTES = 2 * 1024**2
 
 
 class PreparationError(ValueError):
@@ -56,7 +62,7 @@ def selected(path):
     )
 
 
-def parse_header(handle, archive_size):
+def parse_header(handle, archive_size, selector=selected):
     handle.seek(0)
     prefix = read_exact(handle, 8)
     size_payload, header_size = struct.unpack('<II', prefix)
@@ -113,7 +119,7 @@ def parse_header(handle, archive_size):
             if 'link' in entry:
                 if not isinstance(entry['link'], str) or any(k in entry for k in ('size', 'offset', 'unpacked')):
                     fail('INVALID_ENTRY', f'Conflicting link metadata: {path}')
-                if selected(path):
+                if selector(path):
                     fail('UNSUPPORTED_LINK', f'Selected source is a link: {path}')
                 continue  # Never follow even unrelated links.
             unpacked = entry.get('unpacked', False)
@@ -123,7 +129,7 @@ def parse_header(handle, archive_size):
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                 fail('INVALID_ENTRY', f'Invalid file size: {path}')
             if unpacked:
-                if selected(path):
+                if selector(path):
                     fail('UNSUPPORTED_UNPACKED', f'Selected source is outside the ASAR: {path}')
                 continue  # No app.asar.unpacked reads.
             offset = entry.get('offset')
@@ -134,7 +140,7 @@ def parse_header(handle, archive_size):
                 fail('TRUNCATED_ARCHIVE', f'Packed file exceeds archive size: {path}')
             if size:
                 extents.append((start, start + size))
-            if selected(path):
+            if selector(path):
                 files.append({'path': path, 'offset': start, 'size': size})
 
     walk(header['files'])
@@ -148,7 +154,66 @@ def identity(info):
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def prepare(asar, out):
+class ScriptEntries(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.scripts = []
+        self.has_base = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'base':
+            self.has_base = True
+        if tag != 'script':
+            return
+        pairs = dict(attrs)
+        if len(pairs) != len(attrs):
+            fail('AMBIGUOUS_HTML', 'Duplicate attributes in a script element')
+        if pairs.get('src') is not None and pairs.get('type', '').lower() in {'', 'module', 'text/javascript', 'application/javascript'}:
+            self.scripts.append(pairs['src'])
+
+
+def renderer_selection(handle, archive_size):
+    # Inspect packaged HTML only. No code or network requests are executed.
+    html_files, count, offset = parse_header(handle, archive_size,
+        lambda p: 'node_modules' not in p.split('/') and Path(p).suffix.lower() in {'.html', '.htm'})
+    if len(html_files) > MAX_SELECTED_FILES or any(f['size'] > MAX_HTML_BYTES for f in html_files) or sum(f['size'] for f in html_files) > MAX_HTML_TOTAL_BYTES:
+        fail('HTML_SELECTION_TOO_LARGE', 'Packaged HTML selection exceeds bounded inspection limits')
+    selected_paths, html_evidence = set(), []
+    for item in html_files:
+        handle.seek(item['offset'])
+        raw = read_exact(handle, item['size'])
+        try:
+            html = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            fail('SOURCE_NOT_UTF8', f'HTML is not UTF-8: {item["path"]}')
+        parser = ScriptEntries()
+        parser.feed(html)
+        if parser.has_base and parser.scripts:
+            fail('UNSUPPORTED_HTML_BASE', 'HTML base URLs require manual scope selection')
+        refs = []
+        for src in parser.scripts:
+            url = urlsplit(src)
+            decoded = unquote(url.path)
+            if url.scheme or url.netloc or src.startswith('//'):
+                fail('EXTERNAL_RENDERER_ENTRY', 'Renderer entrypoint must be a packed local file')
+            if (not decoded or '\\' in decoded or any(c in decoded for c in '\x00:')
+                    or any(ord(c) < 32 for c in decoded) or '..' in decoded.split('/')):
+                fail('UNSAFE_RENDERER_ENTRY', 'Unsafe renderer entrypoint path')
+            resolved = posixpath.normpath(decoded.lstrip('/') if decoded.startswith('/') else posixpath.join(posixpath.dirname(item['path']), decoded))
+            if Path(resolved).suffix not in {'.js', '.mjs', '.cjs'} or 'node_modules' in resolved.split('/'):
+                fail('UNSUPPORTED_RENDERER_ENTRY', 'Renderer entrypoint must be a local JavaScript source')
+            selected_paths.add(resolved)
+            refs.append({'src': src, 'resolved': resolved})
+        html_evidence.append({**item, 'sha256': hashlib.sha256(raw).hexdigest(), 'scripts': refs})
+    if not selected_paths:
+        fail('NO_RENDERER_ENTRYPOINTS', 'No packaged HTML script-src JavaScript entrypoints found')
+    files, _, _ = parse_header(handle, archive_size, lambda p: p == 'package.json' or p in selected_paths)
+    if selected_paths - {f['path'] for f in files}:
+        fail('RENDERER_ENTRY_MISSING', 'HTML references a JavaScript file missing from the packed archive')
+    return files, count, offset, html_evidence
+
+
+def prepare(asar, out, renderer_entrypoints=False):
     source, destination = Path(asar).absolute(), Path(out).absolute()
     if destination.exists() or destination.is_symlink():
         fail('OUTPUT_EXISTS', 'Output must be a new directory')
@@ -159,15 +224,20 @@ def prepare(asar, out):
             fail('NOT_REGULAR_FILE', 'ASAR input must be a regular file, not a symlink')
         if before.st_size > MAX_ARCHIVE_BYTES:
             fail('ARCHIVE_TOO_LARGE', f'ASAR exceeds {MAX_ARCHIVE_BYTES} bytes')
-        files, count, data_offset = parse_header(handle, before.st_size)
+        html_evidence = []
+        if renderer_entrypoints:
+            files, count, data_offset, html_evidence = renderer_selection(handle, before.st_size)
+        else:
+            files, count, data_offset = parse_header(handle, before.st_size)
         if not any(item['path'] == 'package.json' for item in files):
             fail('PACKAGE_MISSING', 'ASAR root package.json is required')
         if not any(item['path'] != 'package.json' for item in files):
             fail('NO_PRELOAD_CANDIDATES', 'No packed preload .js/.cjs/.mjs candidates; manual selection is required')
         if len(files) > MAX_SELECTED_FILES:
             fail('TOO_MANY_SOURCES', f'Selection exceeds {MAX_SELECTED_FILES} files; narrow the scope manually')
-        if any(item['size'] > MAX_FILE_BYTES for item in files):
-            fail('SOURCE_TOO_LARGE', f'A selected source exceeds {MAX_FILE_BYTES} bytes')
+        file_limit = MAX_RENDERER_FILE_BYTES if renderer_entrypoints else MAX_FILE_BYTES
+        if any(item['size'] > file_limit for item in files):
+            fail('SOURCE_TOO_LARGE', f'A selected source exceeds {file_limit} bytes')
         if sum(item['size'] for item in files) > MAX_SELECTED_BYTES:
             fail('SELECTION_TOO_LARGE', f'Selection exceeds {MAX_SELECTED_BYTES} bytes')
         contents = []
@@ -194,9 +264,10 @@ def prepare(asar, out):
         'status': 'candidate', 'reaExecuted': False, 'runtimeObserved': False,
         'archive': {'path': str(source), 'size': before.st_size,
                     'sha256': archive_hash.hexdigest(), 'dataOffset': data_offset},
-        'selection': {'policy': 'root-package-and-preload-v1', 'entriesInspected': count,
+        'selection': {'policy': 'packaged-html-script-src-v1' if renderer_entrypoints else 'root-package-and-preload-v1', 'entriesInspected': count,
                       'selectedFiles': len(files), 'selectedBytes': sum(x['size'] for x in files)},
         'sourcesDirectory': 'sources',
+        'htmlEntrypoints': html_evidence,
         'files': [{**item, 'outputPath': 'sources/' + item['path'],
                    'sha256': hashlib.sha256(data).hexdigest()} for item, data in zip(files, contents)],
         'limitations': [
@@ -225,9 +296,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--asar', required=True, help='Original packed app.asar (read only)')
     parser.add_argument('--out', required=True, help='New private preparation directory')
+    parser.add_argument('--renderer-entrypoints', action='store_true', help='Select local JavaScript referenced by packaged HTML script src')
     args = parser.parse_args()
     try:
-        manifest = prepare(args.asar, args.out)
+        manifest = prepare(args.asar, args.out, args.renderer_entrypoints)
         print(json.dumps({'ok': True, 'status': 'candidate', 'out': str(Path(args.out).absolute()),
                           'selectedFiles': manifest['selection']['selectedFiles'],
                           'sourcesDirectory': str(Path(args.out).absolute() / 'sources'),
