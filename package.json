@@ -1,0 +1,14 @@
+{
+  "name": "rea-cli-factory-tools",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "scripts": {
+    "test": "node --test skills/rea-cli-factory/scripts/test_*.mjs"
+  },
+  "dependencies": {
+    "@babel/parser": "8.0.4"
+  }
+}

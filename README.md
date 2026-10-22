@@ -14,6 +14,7 @@ A task-oriented agent skill for turning application analysis into verified CLI a
 - [`scripts/probe_app.py`](skills/rea-cli-factory/scripts/probe_app.py)：只读入口候选探测与路由建议，不启动应用。
 - [`scripts/summarize_rea.py`](skills/rea-cli-factory/scripts/summarize_rea.py)：离线筛选 REA 分析证据，保留覆盖范围与源位置。
 - [`scripts/check_compatibility.py`](skills/rea-cli-factory/scripts/check_compatibility.py)：对固定已验证清单做只读兼容性门禁。
+- [静态桥接提取与候选 CLI 生成](skills/rea-cli-factory/references/bridge-generation.md)：从 REA 对应源码自动提取方法和形参，只生成显式选中的调用入口。
 - [重启与升级协议](skills/rea-cli-factory/references/maintenance-validation.md)。
 - [多应用验证协议](skills/rea-cli-factory/references/multi-app-evaluation.md)、离线测试和 GitHub Actions。
 
@@ -21,7 +22,7 @@ A task-oriented agent skill for turning application analysis into verified CLI a
 
 ## 使用
 
-需要 Python 3。应用清单面向 macOS .app；测试使用合成目录，可在 Linux 上运行。
+基础清单/门禁需要 Python 3。静态桥接提取还需 Node.js >=24.11，并在仓库根目录执行 `npm ci --ignore-scripts`；生成运行器的进程绑定仅支持 macOS。应用清单面向 macOS .app；测试使用合成目录，可在 Linux 上运行。
 
 ```bash
 git clone https://github.com/WeltPRICKETT/rea-cli-factory.git
@@ -55,17 +56,19 @@ ln -s "$PWD/skills/rea-cli-factory" "$HOME/.codex/skills/rea-cli-factory"
 
 ```bash
 python3 -m unittest discover -s skills/rea-cli-factory/scripts -p 'test_*.py'
+npm ci --ignore-scripts
+npm test
 ```
 
-32 项回归覆盖身份摘要、内容变化、应用名歧义、路径穿越、符号链接越界、缺失文件、入口候选语义、有界扫描及 REA 摘要的查询、截断、输入错误与信息边界，以及升级变化拒绝、固定基线保护和恢复旧版。测试不联网、不启动应用，不代表任意应用的自动适配能力。
+32 项 Python 回归覆盖身份摘要、内容变化、应用名歧义、路径穿越、符号链接越界、缺失文件、入口候选语义、有界扫描及 REA 摘要的查询、截断、输入错误与信息边界，以及升级变化拒绝、固定基线保护和恢复旧版。另有 18 项 Node 测试覆盖静态映射、作用域/突变拒绝、候选生成、目标绑定和调用失败边界。合计 50 项测试；测试本身不联网、不启动应用，不代表任意应用的自动适配能力。
 
 ## 多应用实测
 
-已在三款应用完成原生命令行/脚本接口的真实产物验证，详见 [试验摘要](docs/generalization-2026-10-22.md)。随后在第四款应用完成了 [REA 辅助内部笔记接口试验](docs/rea-increment-2026-10-22.md)：两次真实导入、读回和导出通过。REA 提供候选位置，仍需代码检查与运行时验证；尚不是任意应用自动适配。后续 [维护试验](docs/maintenance-2026-10-23.md) 已通过两次真实重启读回和受控升级门禁演练；未执行真实应用升级。应用适配器和原始证据仍不公开。
+已在三款应用完成原生命令行/脚本接口的真实产物验证，详见 [试验摘要](docs/generalization-2026-10-22.md)。随后在第四款应用完成了 [REA 辅助内部笔记接口试验](docs/rea-increment-2026-10-22.md)：两次真实导入、读回和导出通过。REA 提供候选位置，仍需代码检查与运行时验证；尚不是任意应用自动适配。后续 [维护试验](docs/maintenance-2026-10-23.md) 已通过两次真实重启读回和受控升级门禁演练；未执行真实应用升级。新增 [Hydrogen Music 生成试验](docs/bridge-generation-2026-10-23.md)，三个实测方法全部由提取器和生成器产生映射；业务语义与生命周期仍需人工确认。应用适配器和原始证据仍不公开。
 
 ## 项目状态
 
-实验性通用工具，面向希望将重复 GUI 任务交给 Agent 的个人开发者。当前公开范围是工作流与应用清单工具；具体应用适配器独立维护。优先级是可验证结果与明确失败，下一里程碑是需要支持新版本时进行受影响接口复验。核心指标是正确性、人工介入次数、整体等待时间和维护成本；无可调用入口、结果不可验证或维护成本高于人工收益时停止该适配方向。
+实验性通用工具，面向希望将重复 GUI 任务交给 Agent 的个人开发者。当前公开范围是工作流与应用清单工具；具体应用适配器独立维护。优先级是可验证结果与明确失败，下一里程碑是在更多静态桥接形态下检验生成器，同时保留版本复验门禁。核心指标是正确性、人工介入次数、整体等待时间和维护成本；无可调用入口、结果不可验证或维护成本高于人工收益时停止该适配方向。
 
 ## 许可证与来源
 

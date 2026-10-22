@@ -8,3 +8,4 @@ __pycache__/
 /private/
 *.asar
 *.epub
+node_modules/
