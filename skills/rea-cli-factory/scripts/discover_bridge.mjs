@@ -130,7 +130,7 @@ export function discover(source, name, evidence) {
   const namespaces = new Set(), bridges = new Set(), renderers = new Set();
   const electronRequire = node => node?.type === 'CallExpression' && node.callee.type === 'Identifier' && node.callee.name === 'require' && node.arguments.length === 1 && node.arguments[0].type === 'StringLiteral' && node.arguments[0].value === 'electron';
   if (!declarations.has('require') && !dirty.has('require')) {
-    for (const stmt of ast.program.body) if (stmt.type === 'VariableDeclaration' && stmt.kind === 'const') {
+    for (const stmt of ast.program.body) if (stmt.type === 'VariableDeclaration') {
       for (const decl of stmt.declarations) if (electronRequire(decl.init)) {
         if (decl.id.type === 'Identifier' && safeBinding(decl.id.name)) namespaces.add(decl.id.name);
         if (decl.id.type === 'ObjectPattern') for (const prop of decl.id.properties) {
@@ -142,14 +142,38 @@ export function discover(source, name, evidence) {
     }
   }
   const isElectron = (node, key, set) => (node?.type === 'Identifier' && set.has(node.name)) || (member(node,key) && node.object.type === 'Identifier' && namespaces.has(node.object.name));
+  // These origins improve diagnostics only: they never authorize a candidate.
+  const importedBindings = new Set(), electronAliases = new Set();
+  const topElectronNames = new Set(ast.program.body.flatMap(s => s.type === 'VariableDeclaration' ? s.declarations : [])
+    .filter(d => d.id.type === 'Identifier' && electronRequire(d.init)).map(d => d.id.name));
+  for (const stmt of ast.program.body) {
+    if (stmt.type === 'ImportDeclaration') for (const spec of stmt.specifiers) importedBindings.add(spec.local.name);
+    if (stmt.type !== 'VariableDeclaration') continue;
+    for (const decl of stmt.declarations) {
+      if (decl.init?.type === 'CallExpression' && decl.init.callee.type === 'Identifier' && decl.init.callee.name === 'require' && !electronRequire(decl.init))
+        boundNames(decl.id).forEach(n => importedBindings.add(n));
+      if (decl.init?.type === 'Identifier' && decl.id.type === 'ObjectPattern' && topElectronNames.has(decl.init.name))
+        boundNames(decl.id).forEach(n => electronAliases.add(n));
+    }
+  }
   const candidates = [], unsupported = [], exposures = [];
-  let ambiguousExposure = false;
-  const reject = (node, reason) => unsupported.push({reason, sourceRange: range(node,name)});
+  let ambiguousExposure = false, exposureCalls = 0;
+  const nextSteps = {
+    'imported-wrapper-call': 'Inspect the imported wrapper source and collect matching REA evidence; cross-module wrapper resolution is not supported.',
+    'factory-created-api': 'Inspect the API factory and its returned object; factory execution is not supported.',
+    'unsupported-electron-alias': 'Inspect the indirect Electron binding and its mutations; namespace destructuring aliases are not resolved.',
+    'no-exposed-api': 'Locate a preload with an exposed bridge or choose a different application interface.',
+    'unsupported-or-mutated-object': 'Inspect how the exposed object is assembled or mutated before selecting methods.',
+    'unknown-or-shadowed-exposure': 'Inspect the bridge binding, scope and mutations; only unambiguous top-level Electron bindings are supported.',
+  };
+  const reject = (node, reason) => unsupported.push({reason, sourceRange: range(node,name),
+    ...(nextSteps[reason] ? {nextStep:nextSteps[reason]} : {})});
   const topCalls = new Set(ast.program.body.filter(s => s.type === 'ExpressionStatement').map(s => s.expression));
   walk(ast, node => {
     if (node.type !== 'CallExpression' || node.callee.type !== 'MemberExpression' || (node.callee.property.name || node.callee.property.value) !== 'exposeInMainWorld') return;
+    exposureCalls++;
     if (node.callee.computed) { ambiguousExposure = true; reject(node,'dynamic-exposure'); return; }
-    if (!topCalls.has(node) || !isElectron(node.callee.object,'contextBridge',bridges)) { ambiguousExposure = true; reject(node,'unknown-or-shadowed-exposure'); return; }
+    if (!topCalls.has(node) || !isElectron(node.callee.object,'contextBridge',bridges)) { ambiguousExposure = true; reject(node,electronAliases.has(rootName(node.callee.object)) ? 'unsupported-electron-alias' : 'unknown-or-shadowed-exposure'); return; }
     if (node.arguments.length !== 2 || node.arguments[0].type !== 'StringLiteral' || !simple(node.arguments[0].value)) { ambiguousExposure = true; reject(node,'dynamic-exposure'); return; }
     exposures.push({node, root:node.arguments[0].value, object:node.arguments[1]});
   });
@@ -176,6 +200,8 @@ export function discover(source, name, evidence) {
       if (call.directives?.length || call.body.length !== 1 || !['ReturnStatement','ExpressionStatement'].includes(call.body[0].type)) return reject(at,'complex-body-or-event-subscription');
       call = call.body[0].argument || call.body[0].expression;
     }
+    if (call?.type === 'CallExpression' && importedBindings.has(rootName(call.callee))) return reject(call,'imported-wrapper-call');
+    if (call?.type === 'CallExpression' && electronAliases.has(rootName(call.callee))) return reject(call,'unsupported-electron-alias');
     if (call?.type !== 'CallExpression' || !['invoke','send'].some(k => member(call.callee,k)) || !isElectron(call.callee.object,'ipcRenderer',renderers)) return reject(at,'unsupported-transport-or-shadowed-ipc');
     if (call.arguments[0]?.type !== 'StringLiteral' || !call.arguments[0].value || call.arguments[0].value.length > 240) return reject(at,'dynamic-channel');
     if (!call.arguments.slice(1).every(a=>safeValue(a,params))) return reject(at,'complex-ipc-arguments');
@@ -186,6 +212,7 @@ export function discover(source, name, evidence) {
   }
   function object(value,path,seen = new Set()) {
     const obj = resolve(value);
+    if (obj?.type === 'CallExpression') return reject(obj,'factory-created-api');
     if (!obj || obj.type !== 'ObjectExpression' || seen.has(obj)) return reject(value,'unsupported-or-mutated-object');
     const nextSeen = new Set(seen); nextSeen.add(obj);
     const keys = new Set();
@@ -206,6 +233,7 @@ export function discover(source, name, evidence) {
     else if (rootCounts.get(exposure.root) !== 1) reject(exposure.node,'duplicate-exposure-root');
     else object(exposure.object,[exposure.root]);
   }
+  if (!exposureCalls) reject(ast.program,'no-exposed-api');
   return {schema:'rea-cli-factory.bridge-contract.v1',evidenceId:evidence.evidence_id,
     source:{name,sha256:digest},coverage:{status:graph.coverage.status,truncated:graph.coverage.truncated,
       omitted_count:graph.coverage.omitted_count ?? null,limits:graph.coverage.limits ?? []},candidates,unsupported,

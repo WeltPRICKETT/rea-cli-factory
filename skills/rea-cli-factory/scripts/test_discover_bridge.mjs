@@ -21,7 +21,9 @@ function evidence(source) {
     }
     for (const [k,v] of Object.entries(node)) if(k!=='loc') {if(Array.isArray(v))v.forEach(walk);else if(v&&typeof v==='object')walk(v);}
   }
-  walk(parse(source,{sourceType:'unambiguous'}));
+  const ast=parse(source,{sourceType:'unambiguous'});
+  walk(ast);
+  nodes.push({kind:'source-file',observations:[{properties:{},evidence:{artifact:{available:true,sha256:digest},location:{available:true,value:{kind:'source-range',source:name,start:{line:ast.program.loc.start.line,column:ast.program.loc.start.column},end:{line:ast.program.loc.end.line,column:ast.program.loc.end.column}}}}}]});
   return {operation:'analyze_javascript_application',evidence_id:'ev_'+'a'.repeat(64),normalized_result:{graph:{coverage:{status:'partial',truncated:false,omitted_count:null,limits:[]},nodes}}};
 }
 const run=source=>discover(source,name,evidence(source));
@@ -89,4 +91,61 @@ test('CLI never overwrites existing output and emits only contract to new file',
     const before=await readFile(out,'utf8');assert.equal(JSON.parse(before).candidates.length,1);
     const second=spawnSync(process.execPath,args,{encoding:'utf8'});assert.equal(second.status,2);assert.equal(JSON.parse(second.stderr).error.code,'EEXIST');assert.equal(await readFile(out,'utf8'),before);
   } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('unique immutable top-level var and let Electron bindings are candidates',()=>{
+  for (const kind of ['var','let']) {
+    for (const source of [
+      `${kind} electron=require('electron');electron.contextBridge.exposeInMainWorld('fixture',{read:()=>electron.ipcRenderer.invoke('read')});`,
+      `${kind} {contextBridge:bridge,ipcRenderer:ipc}=require('electron');bridge.exposeInMainWorld('fixture',{read:()=>ipc.invoke('read')});`,
+    ]) {
+      const result=run(source);
+      assert.equal(result.candidates.length,1);
+      assert.deepEqual(result.unsupported,[]);
+      assert.equal(result.candidates[0].channel,'read');
+    }
+  }
+});
+test('var and let support does not relax redeclaration, reassignment, shadowing or escape checks',()=>{
+  const body="electron.contextBridge.exposeInMainWorld('fixture',{read:()=>electron.ipcRenderer.invoke('read')});";
+  for (const tail of ["var electron;", "electron=other;", "electron.ipcRenderer.invoke=other;", "function scope(electron){}", "const alias=electron;", "unknown(electron);"]) {
+    assert.equal(run("var electron=require('electron');"+body+tail).candidates.length,0,tail);
+  }
+  for (const tail of ["electron=other;", "function scope(electron){}", "electron.contextBridge=other;"]) {
+    assert.equal(run("let electron=require('electron');"+body+tail).candidates.length,0,tail);
+  }
+});
+test('imported wrapper calls get actionable diagnostics without becoming candidates',()=>{
+  const source=header+"const wrapper=require('./wrapper.cjs');contextBridge.exposeInMainWorld('fixture',{read:()=>wrapper.invokeApi(wrapper.channels.read)});";
+  const result=run(source);
+  assert.equal(result.candidates.length,0);
+  assert.equal(result.unsupported[0].reason,'imported-wrapper-call');
+  assert.match(result.unsupported[0].nextStep,/imported wrapper source/);
+  assert.equal(result.unsupported[0].sourceRange.source,name);
+  assert.equal(result.unsupported[0].sourceRange.start.column,source.split('\n')[1].indexOf('wrapper.invokeApi'));
+});
+test('factory-created and conditionally mutated API objects remain unsupported with next steps',()=>{
+  const factory=run(header+"const createApi=require('./factory.cjs');const api=createApi();contextBridge.exposeInMainWorld('fixture',api);");
+  assert.equal(factory.candidates.length,0);
+  assert.equal(factory.unsupported[0].reason,'factory-created-api');
+  assert.match(factory.unsupported[0].nextStep,/factory/);
+  const mutated=run(header+"const api={read:()=>ipcRenderer.invoke('read')};if(flag)api.extra=()=>1;contextBridge.exposeInMainWorld('fixture',api);");
+  assert.equal(mutated.candidates.length,0);
+  assert.equal(mutated.unsupported[0].reason,'unsupported-or-mutated-object');
+  assert.match(mutated.unsupported[0].nextStep,/mutated/);
+});
+test('namespace destructuring aliases diagnose the unresolved binding conservatively',()=>{
+  const result=run("const {contextBridge}=require('electron');const electron=require('electron');const {ipcRenderer}=electron;contextBridge.exposeInMainWorld('fixture',{read:()=>ipcRenderer.invoke('read')});");
+  assert.equal(result.candidates.length,0);
+  assert.equal(result.unsupported[0].reason,'unsupported-electron-alias');
+  assert.match(result.unsupported[0].nextStep,/binding/);
+});
+test('source with no exposed API reports an empty candidate set and explicit discovery next step',()=>{
+  const source="const electron=require('electron');function read(){return electron.ipcRenderer.invoke('read')}";
+  const result=run(source);
+  assert.deepEqual(result.candidates,[]);
+  assert.equal(result.unsupported[0].reason,'no-exposed-api');
+  assert.match(result.unsupported[0].nextStep,/Locate a preload/);
+  assert.equal(result.unsupported[0].sourceRange.start.line,1);
+  assert.throws(()=>discover(source+' ',name,evidence(source)),{code:'SOURCE_DIGEST_MISMATCH'});
 });

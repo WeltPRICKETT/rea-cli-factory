@@ -32,6 +32,8 @@ Electron 候选需验证对应进程/页面、既有 preload/contextBridge 和�
 
 ## 减少重复适配
 
+从未适配过的应用先按 [盲测协议](references/blind-evaluation.md) 冻结工具与首次结果，记录人工介入。ASAR 可用 `scripts/analyze_electron.mjs --asar <包> --rea-cli <已安装 rea.mjs> --out <新私有目录>` 一次完成精选输入、REA 和逐文件提取；0 个候选返回 blocked，不启动应用或继续生成。首次结果保存后才能读实现或改解析器，改进后的重跑必须标为复测。
+
 Electron preload 有对应 REA JSON 时，优先按 [静态桥接生成流程](references/bridge-generation.md) 运行 `discover_bridge.mjs`，自动提取可证实的方法/参数，再用 `generate_bridge_cli.mjs` 为显式选中的窄方法生成候选 CLI。仅支持保守的静态子集；unsupported 保留，不猜测复杂逻辑。生成产物仍是私有应用适配器，不能随通用工具公开。
 
 运行器调用原桥接方法，绑定本机进程/页面和固定基线；`dispatched`/`returned` 都不是业务 verified。业务参数语义、启动隔离、清理和独立读回仍需验证。分别记录自动恢复的方法数、实际验证数、剩余人工步骤和计时范围，不把再生成速度当作首次交付速度。
