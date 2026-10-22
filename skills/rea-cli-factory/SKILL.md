@@ -24,6 +24,8 @@ description: 为指定应用的具体任务制作并验证 Agent 可用的 CLI�
 
 区分 `candidate`（静态发现）、`callable`（真实调用被接受）、`verified`（结果读回成功）、`blocked`（有具体阻塞）与 `unsupported`（本适配器不支持）。不要根据字符串、IPC 名称、网络端点或函数签名直接生成“已支持”命令。
 
+对于本地 REA JavaScript JSON，可用 `scripts/summarize_rea.py --input evidence.json --query <feature>` 读取小摘要，保留源位置与覆盖范围；摘要不替代原始 Evidence，不验证其签名/摘要，也不自动证明运行时可达。输出用于本地开发，不作为自动脱敏发布材料。
+
 REA 的 partial/超时结果应保留已完成证据和缺口。先查看局部记录或缩小到相关模块；除非新增问题确实依赖缺失部分，不强制全量重跑。精选文件的分析不能称作完整应用分析。
 
 Electron 候选需验证对应进程/页面、既有 preload/contextBridge 和实际可达性。被动观察不等于动作执行。使用另一个执行器时写明边界，绑定实际应用及目标身份，限定到任务所需操作。需要 GUI、登录或本地调试会话就如实标注，不能称为无界面自动化。
