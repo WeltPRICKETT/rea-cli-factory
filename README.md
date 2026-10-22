@@ -11,7 +11,8 @@ A task-oriented agent skill for turning application analysis into verified CLI a
 - [`skills/rea-cli-factory/SKILL.md`](skills/rea-cli-factory/SKILL.md)：面向 Agent 的通用开发工作流。
 - [`references/adapter-contract.md`](skills/rea-cli-factory/references/adapter-contract.md)：目标身份、动作、结果、失败和验证契约。
 - [`scripts/inventory_app.py`](skills/rea-cli-factory/scripts/inventory_app.py)：macOS 应用清单与摘要工具，只读取包身份，不启动应用或读取账号数据。
-- 清单工具的离线测试和 GitHub Actions。
+- [`scripts/probe_app.py`](skills/rea-cli-factory/scripts/probe_app.py)：只读入口候选探测与路由建议，不启动应用。
+- [多应用验证协议](skills/rea-cli-factory/references/multi-app-evaluation.md)、离线测试和 GitHub Actions。
 
 **不包含任何应用专用 CLI、专用 Skill、逆向提取源码、运行收据或下载内容。** MCP 是可选扩展方向，目前没有实现 MCP server。
 
@@ -23,6 +24,7 @@ A task-oriented agent skill for turning application analysis into verified CLI a
 git clone https://github.com/WeltPRICKETT/rea-cli-factory.git
 cd rea-cli-factory
 python3 skills/rea-cli-factory/scripts/inventory_app.py --app '/Applications/YourApp.app'
+python3 skills/rea-cli-factory/scripts/probe_app.py --app '/Applications/YourApp.app'
 ```
 
 清单输出包含包标识、版本、主程序与可选 app.asar 的 SHA-256；清单不是 REA 分析，也不是运行时验收。
@@ -44,7 +46,11 @@ ln -s "$PWD/skills/rea-cli-factory" "$HOME/.codex/skills/rea-cli-factory"
 python3 -m unittest discover -s skills/rea-cli-factory/scripts -p 'test_*.py'
 ```
 
-6 项回归覆盖身份摘要、内容变化、应用名歧义、路径穿越、符号链接越界和缺失文件。测试不联网、不启动应用，不代表任意应用的自动适配能力。
+11 项回归覆盖身份摘要、内容变化、应用名歧义、路径穿越、符号链接越界、缺失文件、入口候选语义和有界扫描。测试不联网、不启动应用，不代表任意应用的自动适配能力。
+
+## 多应用实测
+
+已在三款应用完成原生命令行/脚本接口的真实产物验证，详见 [试验摘要](docs/generalization-2026-10-22.md)。本轮没有调用 REA，不能据此宣称逆向分析增量或任意应用自动适配。应用适配器和原始证据仍不公开。
 
 ## 项目状态
 
